@@ -1,0 +1,18 @@
+KOSH — EFFICIENCY GATEWAY FOR THE BHARATCODE MODEL API
+BharatCode Build League · Round 1 · Track: Coding & Developer Tools
+
+PROBLEM
+On BharatCode's shared GPU, a token sent that did not need sending is
+capacity somebody else could have used. Agents resend identical system
+prompts, tool definitions and file contents every turn, re-ask near-identical
+questions, and retry in lockstep on HTTP 503, worsening the queue.
+
+THESIS
+The cheapest token is the one you never send.
+
+WHAT IT IS
+A drop-in OpenAI-compatible gateway for the BharatCode API. Any OpenAI SDK
+works by changing one line: base_url.
+
+STATUS
+In progress. See README.md.
