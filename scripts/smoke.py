@@ -49,7 +49,7 @@ def call(base: str, prompt: str) -> tuple[float, int, str]:
         json={
             "model": MODEL,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
+            "stream": True,
             "max_tokens": 256,
         },
         headers={"Authorization": f"Bearer {KEY}"},
