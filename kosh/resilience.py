@@ -23,6 +23,7 @@ the streaming and non-streaming paths retry the *open*, never the body.
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -35,9 +36,25 @@ RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 # Our request is wrong. Retrying only burns shared capacity.
 FATAL_STATUS = {400, 401, 402, 403, 404, 405, 406, 413, 422}
 
-MAX_ATTEMPTS = 4
-BASE_DELAY = 2.0      # ceilings: 2s -> 4s -> 8s -> 16s
-MAX_DELAY = 16.0
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.getenv(name, "")))
+    except (TypeError, ValueError):
+        return default
+
+
+# Tunable so benchmarks and tests can run fast, and so operators can pick
+# their own patience. Defaults are the production values.
+MAX_ATTEMPTS = _env_int("KOSH_MAX_ATTEMPTS", 4)
+BASE_DELAY = _env_float("KOSH_BACKOFF_BASE", 2.0)   # ceilings: 2s -> 4s -> 8s -> 16s
+MAX_DELAY = _env_float("KOSH_BACKOFF_CAP", 16.0)
 
 
 def backoff_delay(attempt: int, base: float = BASE_DELAY, cap: float = MAX_DELAY) -> float:
