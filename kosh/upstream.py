@@ -56,6 +56,7 @@ async def stream_upstream(
     headers: dict,
     request_id: str,
     breaker: CircuitBreaker,
+    extra_headers: dict[str, str] | None = None,
 ) -> StreamingResponse | JSONResponse:
     """Proxy a streaming chat-completions request, byte for byte."""
     result = await open_with_retry(client, url, body, headers, breaker)
@@ -95,6 +96,7 @@ async def stream_upstream(
             **SSE_HEADERS,
             "x-kosh-request-id": request_id,
             "x-kosh-attempts": str(result.attempts),
+            **(extra_headers or {}),
         },
     )
 
@@ -106,6 +108,7 @@ async def collect_upstream(
     headers: dict,
     request_id: str,
     breaker: CircuitBreaker,
+    extra_headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """Non-streaming path: open with retry, then read the whole body."""
     started = time.perf_counter()
@@ -147,5 +150,6 @@ async def collect_upstream(
             "x-kosh-request-id": request_id,
             "x-kosh-latency-ms": str(elapsed_ms),
             "x-kosh-attempts": str(result.attempts),
+            **(extra_headers or {}),
         },
     )

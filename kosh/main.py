@@ -30,6 +30,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from kosh.replay import PROFILES, ReplayConfig, ReplayTransport, config_from_env
+from kosh.shaping import MODES as SHAPE_MODES, shape_request
 from kosh.resilience import CircuitBreaker
 from kosh.upstream import collect_upstream, stream_upstream
 
@@ -49,6 +50,14 @@ DEFAULT_MODEL = os.getenv("KOSH_MODEL", "qwen-3.8-27b")
 SHARED_UPSTREAM_KEY = os.getenv("KOSH_UPSTREAM_KEY", "")
 
 TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
+
+
+def _shape_mode() -> str:
+    """report by default: measure and tell, never silently rewrite."""
+    mode = os.getenv("KOSH_SHAPE", "report").strip().lower()
+    if mode not in SHAPE_MODES:
+        raise ValueError(f"unknown KOSH_SHAPE {mode!r}; choose from {SHAPE_MODES}")
+    return mode
 
 
 def create_app(replay: ReplayConfig | None = None) -> FastAPI:
@@ -99,6 +108,7 @@ def create_app(replay: ReplayConfig | None = None) -> FastAPI:
                 "fixtures": len(replay.fixtures),
                 "speed": replay.speed,
             },
+            "shaping": {"mode": _shape_mode(), "available": list(SHAPE_MODES)},
             "breaker": {
                 "state": breaker.state,
                 "failures": breaker.failures,
@@ -167,16 +177,21 @@ def create_app(replay: ReplayConfig | None = None) -> FastAPI:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        # Stage 2 of the pipeline: shape before anything is sent. Report mode
+        # only measures, so the default never alters what the model sees.
+        shaped, report = shape_request(body, _shape_mode())
+        extra = report.as_headers()
+
         client = request.app.state.transport
         breaker: CircuitBreaker = request.app.state.breaker
 
-        if body.get("stream"):
+        if shaped.get("stream"):
             return await stream_upstream(
-                client, UPSTREAM_URL, body, headers, request_id, breaker
+                client, UPSTREAM_URL, shaped, headers, request_id, breaker, extra
             )
 
         return await collect_upstream(
-            client, UPSTREAM_URL, body, headers, request_id, breaker
+            client, UPSTREAM_URL, shaped, headers, request_id, breaker, extra
         )
 
     return app

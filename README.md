@@ -9,6 +9,7 @@ wasted GPU work, survives queue saturation, and shows you what you spent.
 
 On a shared GPU, every token you send that did not need sending is capacity
 somebody else could have used.
+We measured BharatCode's prefix cache directly. A repeated 2,093-token prompt serves 800 tokens from cache. Changing one character at the front drops that to zero — identically expensive to sending a completely different prompt.
 
 **The cheapest token is the one you never send.**
 
