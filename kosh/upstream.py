@@ -138,6 +138,7 @@ async def stream_upstream(
         buffer = bytearray()
         started = time.perf_counter()
         saw_bytes = False
+        completed = False
         try:
             # Raw byte passthrough. We do NOT re-frame the SSE: the provider
             # already emits `data: {...}\n\n`, keepalives and `data: [DONE]`.
@@ -152,6 +153,7 @@ async def stream_upstream(
                 if cache_key:
                     buffer.extend(chunk)      # client first, always
                 yield chunk
+            completed = True
         except httpx.HTTPError as exc:
             # Upstream died mid-stream. Tell the client instead of leaving it
             # waiting on a stream that will never finish. Never cache a
@@ -170,32 +172,48 @@ async def stream_upstream(
                 record.latency_ms = (time.perf_counter() - started) * 1000
             yield f"data: {payload}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
-        else:
-            # Completed cleanly — now it is safe to store.
-            #
-            # A 200 with zero bytes is not a clean completion. It arrives as
-            # an empty body and, because the buffer never filled, as a cache
-            # miss on every subsequent identical request — which looks
-            # exactly like "caching is broken". Record it so the ledger shows
-            # the real fault instead of a silent row of misses.
-            if not saw_bytes:
-                if record is not None:
-                    record.error = "empty_stream"
-            if cache_key:
-                lines, text, finish_reason = parse_sse(bytes(buffer))
-                if cache is not None:
-                    cache.store(cache_key, lines, text, finish_reason)
-                # Independent of the exact cache on purpose: KOSH_CACHE=0
-                # must not silently disable near-duplicate storage too.
-                if semantic is not None and semantic.enabled and prompt_text:
-                    semantic.store(cache_key, prompt_text, lines, finish_reason)
-            if record is not None:
-                _lines, text, finish_reason = parse_sse(bytes(buffer))
-                record.completion_tokens = max(0, len(text) // 4)
-                record.latency_ms = (time.perf_counter() - started) * 1000
-                if finish_reason in ("", "error"):
-                    record.error = "incomplete" if not finish_reason else finish_reason
         finally:
+            # The store lives here, NOT in an `else:` clause, and this is the
+            # single most important comment in the streaming path.
+            #
+            # An `else:` block only runs if the try body completes without an
+            # exception. When the ASGI layer decides the response is finished
+            # it closes this generator, which throws GeneratorExit at the
+            # last `yield`. GeneratorExit is not an httpx.HTTPError, so it
+            # propagates, `else:` is skipped, and the store never runs — no
+            # streamed response is ever cached. Whether that happens depends
+            # on platform timing, so the same code cached everything on one
+            # machine and nothing on another.
+            #
+            # A stream is safe to cache only when we know it terminated, and
+            # there are two ways to know:
+            #   1. the upstream iterator finished normally (completed), or
+            #   2. the buffer already carries the provider's terminal frame.
+            # Case 2 is what covers the closed-early path.
+            raw = bytes(buffer)
+            terminated = completed or b"data: [DONE]" in raw
+
+            if saw_bytes and terminated:
+                lines, text, finish_reason = parse_sse(raw)
+                if cache_key:
+                    if cache is not None:
+                        cache.store(cache_key, lines, text, finish_reason)
+                    # Independent of the exact cache on purpose: KOSH_CACHE=0
+                    # must not silently disable near-duplicate storage too.
+                    if semantic is not None and semantic.enabled and prompt_text:
+                        semantic.store(cache_key, prompt_text, lines, finish_reason)
+                if record is not None:
+                    record.completion_tokens = max(0, len(text) // 4)
+                    record.latency_ms = (time.perf_counter() - started) * 1000
+                    if finish_reason in ("", "error"):
+                        record.error = ("incomplete" if not finish_reason
+                                        else finish_reason)
+            elif not saw_bytes and record is not None:
+                # A 200 with zero bytes is not a clean completion. It arrives
+                # as an empty body and, because the buffer never filled, as a
+                # cache miss on every later identical request — which looks
+                # exactly like "caching is broken". Record the real fault.
+                record.error = "empty_stream"
             # Runs on success, on error AND on client disconnect. Without this
             # we leak a provider concurrency slot on every abandoned request.
             await upstream.aclose()

@@ -586,3 +586,58 @@ async def test_exact_cache_wins_when_both_are_on(monkeypatch, stream):
     _env(monkeypatch, KOSH_CACHE="1", KOSH_SEMANTIC_THRESHOLD="0.92")
     got = await _serve([_PROMPT, _PROMPT, _NEAR], stream=stream)
     assert got == ["miss", "hit", "near"]
+
+
+@pytest.mark.asyncio
+async def test_stream_store_survives_generator_closed_before_it_resumes():
+    """Reproduces the Windows behaviour directly, without needing Windows.
+
+    Closing an async generator throws GeneratorExit at its last yield. That
+    is not an httpx.HTTPError, so it propagates and Python skips an `else:`
+    clause entirely - the cache store never ran, and NO streamed response was
+    ever cached. Whether the ASGI layer closes the generator before it
+    resumes past the final yield is platform- and timing-dependent, which is
+    why identical code cached everything on one machine and nothing on
+    another.
+
+    So: consume up to and including the terminal [DONE] frame, then close the
+    generator instead of letting it resume. The store must still happen.
+    """
+    from kosh.replay import ReplayConfig, ReplayTransport
+    from kosh.resilience import CircuitBreaker
+    from kosh.upstream import stream_upstream
+
+    sem = SemanticCache(threshold=0.92)
+    breaker = CircuitBreaker(threshold=99, reset_after=30.0)
+    # ReplayTransport stands in for httpx.AsyncClient itself (it implements
+    # build_request and send), so it is passed as `client` directly rather
+    # than being wrapped as a transport.
+    client = ReplayTransport(ReplayConfig(enabled=True, profile="clean"))
+    if True:
+        resp = await stream_upstream(
+            client=client,
+            url="http://replay.invalid/v1/chat/completions",
+            body={"model": "m", "stream": True,
+                  "messages": [{"role": "user", "content": _PROMPT}]},
+            headers={"Authorization": "Bearer t"},
+            request_id="rid",
+            breaker=breaker,
+            cache=None,
+            cache_key="k1",
+            semantic=sem,
+            prompt_text=_PROMPT,
+        )
+        iterator = resp.body_iterator
+        chunks = []
+        async for chunk in iterator:
+            chunks.append(chunk)
+            if b"data: [DONE]" in chunk:
+                break              # terminal frame delivered; do NOT resume
+        await iterator.aclose()    # GeneratorExit is thrown at the yield
+
+    assert chunks, "expected a streamed body"
+    assert len(sem) == 1, (
+        "the store did not survive the generator being closed - it is either "
+        "still in an `else:` clause (skipped on close) or it only trusts "
+        "normal iteration instead of the terminal [DONE] frame"
+    )
