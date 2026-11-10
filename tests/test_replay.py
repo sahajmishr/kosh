@@ -298,4 +298,3 @@ def test_truncate_lines_keeps_some_content():
     assert len(cut) < len(lines)
     assert cut[-1] == "data: [DONE]"
     assert "length" in cut[-2]
-

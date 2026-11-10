@@ -1,9 +1,14 @@
 """
-Kosh — upstream core (Day 3).
+Kosh — upstream core (Day 6).
 
 Both paths retry the *open* (via resilience.open_with_retry) and never the
 body. Once tokens are flowing, a retry would regenerate everything already
 produced — doubling cost for the user and load for the shared GPU.
+
+Streaming responses are now TEE'd into the cache: every chunk goes to the
+client the instant it arrives, and simultaneously into a buffer. The entry
+is stored only after the stream completes cleanly. We never buffer-then-
+forward, because that would destroy streaming to save a round trip.
 """
 from __future__ import annotations
 
@@ -14,6 +19,8 @@ from typing import AsyncIterator
 import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from kosh.cache import ExactCache, parse_sse
+from kosh.ledger import RequestRecord
 from kosh.resilience import CircuitBreaker, UpstreamResult, open_with_retry
 
 # Stop proxies and browsers from buffering an SSE stream.
@@ -49,16 +56,53 @@ def _error_response(result: UpstreamResult, request_id: str) -> JSONResponse:
     )
 
 
+def _sse_from_lines(lines: list[str]) -> bytes:
+    return b"".join((line + "\n\n").encode("utf-8") for line in lines)
+
+
+def _cache_hit_stream(entry) -> StreamingResponse:
+    """Replay a cached response as SSE, byte for byte."""
+    payload = _sse_from_lines(entry.lines)
+    return StreamingResponse(
+        iter([payload]),
+        media_type="text/event-stream",
+        headers={
+            **SSE_HEADERS,
+            "x-kosh-cache": "hit",
+            "x-kosh-attempts": "0",
+        },
+    )
+
+
 async def stream_upstream(
-    client: httpx.AsyncClient,
+    client,
     url: str,
     body: dict,
     headers: dict,
     request_id: str,
     breaker: CircuitBreaker,
     extra_headers: dict[str, str] | None = None,
+    cache: ExactCache | None = None,
+    cache_key: str | None = None,
+    record: RequestRecord | None = None,
 ) -> StreamingResponse | JSONResponse:
     """Proxy a streaming chat-completions request, byte for byte."""
+    # --- cache lookup (before we touch the upstream at all) -----------------
+    if cache is not None and cache_key:
+        entry = cache.get(cache_key)
+        if entry is not None:
+            if record is not None:
+                record.cache = "hit"
+                record.completion_tokens = entry.completion_tokens
+                record.saved_tokens = entry.completion_tokens
+                record.attempts = 0
+                record.latency_ms = 0.0
+            response = _cache_hit_stream(entry)
+            for name, value in (extra_headers or {}).items():
+                response.headers[name] = value
+            response.headers["x-kosh-cache"] = "hit"
+            return response
+
     result = await open_with_retry(client, url, body, headers, breaker)
     if result.response is None:
         return _error_response(result, request_id)
@@ -66,15 +110,22 @@ async def stream_upstream(
     upstream = result.response
 
     async def generate() -> AsyncIterator[bytes]:
+        buffer = bytearray()
+        started = time.perf_counter()
         try:
             # Raw byte passthrough. We do NOT re-frame the SSE: the provider
             # already emits `data: {...}\n\n`, keepalives and `data: [DONE]`.
             # Parsing and rebuilding would only introduce bugs.
             async for chunk in upstream.aiter_bytes():
+                if cache is not None:
+                    buffer.extend(chunk)      # tee: client first, always
                 yield chunk
         except httpx.HTTPError as exc:
             # Upstream died mid-stream. Tell the client instead of leaving it
-            # waiting on a stream that will never finish.
+            # waiting on a stream that will never finish. Never cache a
+            # fragment — we have no idea if it is complete.
+            if cache is not None:
+                cache.stats.rejects += 1
             payload = json.dumps(
                 {
                     "error": "upstream_disconnected",
@@ -82,38 +133,103 @@ async def stream_upstream(
                     "kosh_request_id": request_id,
                 }
             )
+            if record is not None:
+                record.error = "upstream_disconnected"
+                record.latency_ms = (time.perf_counter() - started) * 1000
             yield f"data: {payload}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
+        else:
+            # Completed cleanly — now it is safe to store.
+            if cache is not None and cache_key:
+                lines, text, finish_reason = parse_sse(bytes(buffer))
+                cache.store(cache_key, lines, text, finish_reason)
+            if record is not None:
+                _lines, text, finish_reason = parse_sse(bytes(buffer))
+                record.completion_tokens = max(0, len(text) // 4)
+                record.latency_ms = (time.perf_counter() - started) * 1000
+                if finish_reason in ("", "error"):
+                    record.error = "incomplete" if not finish_reason else finish_reason
         finally:
             # Runs on success, on error AND on client disconnect. Without this
             # we leak a provider concurrency slot on every abandoned request.
             await upstream.aclose()
 
-    return StreamingResponse(
+    response = StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={
             **SSE_HEADERS,
             "x-kosh-request-id": request_id,
             "x-kosh-attempts": str(result.attempts),
+            "x-kosh-cache": "miss",
             **(extra_headers or {}),
         },
     )
+    return response
 
 
 async def collect_upstream(
-    client: httpx.AsyncClient,
+    client,
     url: str,
     body: dict,
     headers: dict,
     request_id: str,
     breaker: CircuitBreaker,
     extra_headers: dict[str, str] | None = None,
+    cache: ExactCache | None = None,
+    cache_key: str | None = None,
+    record: RequestRecord | None = None,
 ) -> JSONResponse:
     """Non-streaming path: open with retry, then read the whole body."""
+    if cache is not None and cache_key:
+        entry = cache.get(cache_key)
+        if entry is not None:
+            if record is not None:
+                record.cache = "hit"
+                record.completion_tokens = entry.completion_tokens
+                record.saved_tokens = entry.completion_tokens
+                record.attempts = 0
+                record.latency_ms = 0.0
+            # Serve the ORIGINAL body verbatim. A cache hit must be
+            # indistinguishable from the response that filled the cache —
+            # same id, same timestamps, same usage. Anything less breaks the
+            # drop-in contract for anyone logging response ids.
+            if entry.payload is None:
+                payload = {
+                    "id": f"chatcmpl-kosh-{entry.key[:12]}",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": body.get("model", ""),
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": entry.text},
+                        "finish_reason": entry.finish_reason,
+                    }],
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": entry.completion_tokens,
+                        "total_tokens": entry.completion_tokens,
+                    },
+                }
+            else:
+                payload = entry.payload
+            return JSONResponse(
+                content=payload,
+                headers={
+                    "x-kosh-cache": "hit",
+                    "x-kosh-latency-ms": "0.0",
+                    "x-kosh-attempts": "0",
+                    **(extra_headers or {}),
+                },
+            )
+
     started = time.perf_counter()
     result = await open_with_retry(client, url, body, headers, breaker)
     if result.response is None:
+        if record is not None:
+            record.status = result.status or 502
+            record.attempts = result.attempts
+            record.error = result.error
         return _error_response(result, request_id)
 
     upstream = result.response
@@ -144,12 +260,54 @@ async def collect_upstream(
             },
         )
 
+    # Cache only what we can prove is complete.
+    if cache is not None and cache_key:
+        finish_reason = ""
+        choices = payload.get("choices") or []
+        if choices:
+            finish_reason = choices[0].get("finish_reason") or ""
+        if finish_reason in ("stop", "tool_calls", "function_call"):
+            text = ""
+            if choices and isinstance(choices[0].get("message"), dict):
+                text = choices[0]["message"].get("content") or ""
+            replay = [
+                "data: " + json.dumps({
+                    "id": payload.get("id", ""),
+                    "object": "chat.completion.chunk",
+                    "created": payload.get("created", 0),
+                    "model": payload.get("model", ""),
+                    "choices": [{"index": 0, "delta": {"content": text},
+                                 "finish_reason": None}],
+                }, separators=(",", ":")),
+                "data: " + json.dumps({
+                    "id": payload.get("id", ""),
+                    "object": "chat.completion.chunk",
+                    "created": payload.get("created", 0),
+                    "model": payload.get("model", ""),
+                    "choices": [{"index": 0, "delta": {},
+                                 "finish_reason": finish_reason}],
+                }, separators=(",", ":")),
+                "data: [DONE]",
+            ]
+            cache.store(cache_key, replay, text, finish_reason, payload=payload)
+
+    if record is not None:
+        usage = payload.get("usage") or {}
+        record.prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        record.completion_tokens = int(usage.get("completion_tokens") or 0)
+        record.latency_ms = elapsed_ms
+        record.attempts = result.attempts
+        choices = payload.get("choices") or []
+        if choices and choices[0].get("finish_reason") == "length":
+            record.error = "truncated"
+
     return JSONResponse(
         content=payload,
         headers={
             "x-kosh-request-id": request_id,
             "x-kosh-latency-ms": str(elapsed_ms),
             "x-kosh-attempts": str(result.attempts),
+            "x-kosh-cache": "miss",
             **(extra_headers or {}),
         },
     )

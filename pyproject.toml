@@ -4,9 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kosh"
-version = "0.3.0"
+version = "0.7.0"
 description = "Drop-in, provider-agnostic efficiency gateway for LLM APIs"
+readme = "README.md"
 requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.26",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.23"]
 
 [tool.setuptools.packages.find]
 include = ["kosh*"]

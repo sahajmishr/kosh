@@ -1,0 +1,38 @@
+{
+  "total_requests": 59,
+  "total_hits": 32,
+  "hit_pct": 54.2,
+  "false_hits": 0,
+  "false_hit_pct": 0.0,
+  "false_hit_examples": [],
+  "tokens_served_from_cache": 1236,
+  "tokens_total": 2304,
+  "upstream_calls": 27,
+  "slices": {
+    "adversarial": {
+      "requests": 3,
+      "hits": 0,
+      "hit_pct": 0.0
+    },
+    "unique": {
+      "requests": 16,
+      "hits": 0,
+      "hit_pct": 0.0
+    },
+    "exact duplicates": {
+      "requests": 16,
+      "hits": 16,
+      "hit_pct": 100.0
+    },
+    "near duplicates": {
+      "requests": 16,
+      "hits": 16,
+      "hit_pct": 100.0
+    },
+    "long-context": {
+      "requests": 8,
+      "hits": 0,
+      "hit_pct": 0.0
+    }
+  }
+}

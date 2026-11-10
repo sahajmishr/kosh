@@ -48,6 +48,12 @@ if "--real-backoff" not in sys.argv:
     os.environ.setdefault("KOSH_BACKOFF_BASE", "0.01")
     os.environ.setdefault("KOSH_BACKOFF_CAP", "0.05")
 
+# The cache is OFF here on purpose. This benchmark isolates retry, backoff
+# and the circuit breaker; leaving caching on would credit it for work the
+# resilience layer did, and the two mechanisms must be measured separately.
+# See bench_cache.py for the cache numbers.
+os.environ["KOSH_CACHE"] = "0"
+
 from kosh.main import create_app                                    # noqa: E402
 from kosh.replay import (                                           # noqa: E402
     PROFILES,

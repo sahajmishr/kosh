@@ -1,37 +1,41 @@
 """
-Kosh — Day 4. Drop-in, provider-agnostic gateway with resilience + replay.
+Kosh — drop-in, provider-agnostic efficiency gateway for LLM APIs.
 
-Progress:
-  Day 1  non-streaming proxy                        [done]
-  Day 2  SSE streaming passthrough                  [done]
-  Day 3  retry + jittered backoff + circuit breaker [done]  22 tests
-  Day 4  replay mode (KOSH_REPLAY=1)                [done]
-  Day 5  request shaping / prefix hygiene           <- the differentiator
-  Day 6  exact cache (SHA-256 canonical)
-  Day 7  SQLite ledger + /stats dashboard
-  Day 8  MVP FREEZE + benchmark
-  Day 9-11 stretch, docs, submit
+    client = OpenAI(base_url="http://localhost:8000/v1", api_key="bc-...")
 
-THE ONE-LINE DEMO
-    client = OpenAI(base_url="http://localhost:8000/v1", api_key="anything")
+That one line is the whole integration. Everything else Kosh does — shaping,
+caching, retry, circuit breaking, accounting — happens behind it.
 
-With KOSH_REPLAY=1 that line works with no API key, no account, no network
-and no GPU. Anyone can evaluate Kosh in under a minute.
+Pipeline (nine stages; seven are live):
+    1 auth      2 shape      3 cache      4 route
+    5 admit     6 call+retry 7 stream     8 record
+
+THE THESIS
+    The cheapest token is the one you never send — and on a shared GPU,
+    every token you don't send is latency somebody else gets back.
+
+Version 0.7.0 · BharatCode Build League Round 1
 """
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse
+from starlette.background import BackgroundTask
 
+from kosh.cache import ExactCache, cache_from_env
+from kosh.dashboard import render as render_dashboard
+from kosh.ledger import RequestRecord, ledger_from_env
 from kosh.replay import PROFILES, ReplayConfig, ReplayTransport, config_from_env
-from kosh.shaping import MODES as SHAPE_MODES, shape_request
 from kosh.resilience import CircuitBreaker
+from kosh.shaping import MODES as SHAPE_MODES
+from kosh.shaping import flatten, shape_request
 from kosh.upstream import collect_upstream, stream_upstream
 
 load_dotenv()
@@ -45,8 +49,7 @@ UPSTREAM_BASE = os.getenv("KOSH_UPSTREAM_BASE", "https://bharatcode.ai/api/model
 UPSTREAM_URL = f"{UPSTREAM_BASE}/chat/completions"
 DEFAULT_MODEL = os.getenv("KOSH_MODEL", "qwen-3.8-27b")
 
-# Set -> one shared upstream key (dev / fallback mode).
-# Empty -> caller's own key is passed through (BharatCode mode).
+# Set -> one shared upstream key. Empty -> caller's key passes through.
 SHARED_UPSTREAM_KEY = os.getenv("KOSH_UPSTREAM_KEY", "")
 
 TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
@@ -60,39 +63,50 @@ def _shape_mode() -> str:
     return mode
 
 
+def _estimate_prompt_tokens(body: dict) -> int:
+    """Rough, and only used for the savings ledger — never for billing."""
+    try:
+        return max(0, len(flatten(body.get("messages") or [])) // 4)
+    except Exception:
+        return 0
+
+
 def create_app(replay: ReplayConfig | None = None) -> FastAPI:
     """Build the app.
 
     A factory rather than a module-level singleton, so tests and benchmarks
-    can create an app with a fresh circuit breaker and a specific fault
-    profile. Breaker state is global by design within one app — but two
-    benchmark scenarios must not contaminate each other.
+    can create an app with a fresh circuit breaker and a given fault profile.
     """
     if replay is None:
         replay = config_from_env()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # ONE client for the whole app lifetime. Creating a client per request
+        # ONE client for the whole app lifetime. Creating one per request
         # leaks connections — the classic asyncio mistake.
         app.state.upstream = httpx.AsyncClient(timeout=TIMEOUT)
-        # Shared across all requests: the breaker is global state by design,
-        # because the upstream's health is a property of the upstream, not of
-        # any single caller.
+        # Global by design: upstream health is a property of the upstream,
+        # not of any single caller.
         app.state.breaker = CircuitBreaker(
             threshold=int(os.getenv("KOSH_BREAKER_THRESHOLD", "5")),
             reset_after=float(os.getenv("KOSH_BREAKER_RESET", "30")),
         )
-        # Replay REPLACES THE TRANSPORT, never the logic: retry, jitter and
+        # Replay replaces the TRANSPORT, never the logic: retry, jitter and
         # the breaker all run unchanged, they just never reach the network.
         app.state.replay = replay
         app.state.transport = (
             ReplayTransport(replay) if replay.enabled else app.state.upstream
         )
+        app.state.cache = cache_from_env()
+        app.state.ledger = ledger_from_env()
+        app.state.started = time.time()
         yield
         await app.state.upstream.aclose()
+        app.state.ledger.close()
 
-    app = FastAPI(title="Kosh", version="0.4.0", lifespan=lifespan)
+    app = FastAPI(title="Kosh", version="0.7.0", lifespan=lifespan)
+
+    # ------------------------------------------------------------ routes --
 
     @app.get("/health")
     async def health():
@@ -106,34 +120,60 @@ def create_app(replay: ReplayConfig | None = None) -> FastAPI:
                 "enabled": replay.enabled,
                 "profile": replay.profile,
                 "fixtures": len(replay.fixtures),
-                "speed": replay.speed,
             },
-            "shaping": {"mode": _shape_mode(), "available": list(SHAPE_MODES)},
+            "shaping": {"mode": _shape_mode()},
             "breaker": {
                 "state": breaker.state,
                 "failures": breaker.failures,
                 "opened_count": breaker.opened_count,
             },
+            "cache": {**app.state.cache.stats.as_dict(),
+                      "entries": len(app.state.cache)},
         }
 
     @app.get("/")
     async def root():
-        """Enough information to use Kosh without reading the README."""
         return {
             "name": "Kosh",
-            "version": "0.4.0",
-            "endpoints": ["/v1/chat/completions", "/health", "/fixtures"],
+            "version": "0.7.0",
+            "endpoints": {
+                "/v1/chat/completions": "OpenAI-compatible drop-in",
+                "/dashboard": "live HTML dashboard",
+                "/stats": "JSON aggregates from the ledger",
+                "/health": "breaker, cache and replay state",
+                "/fixtures": "what replay is serving",
+            },
             "drop_in": "OpenAI(base_url='http://localhost:8000/v1', api_key='...')",
-            "replay": {
-                "enabled": replay.enabled,
-                "profile": replay.profile,
-                "available_profiles": sorted(PROFILES),
+            "replay": {"enabled": replay.enabled,
+                       "profiles": sorted(PROFILES)},
+        }
+
+    @app.get("/stats")
+    async def stats():
+        """Aggregates. This is the receipt."""
+        return {
+            "totals": app.state.ledger.totals(),
+            "latency_uncached": app.state.ledger.latency_percentiles(),
+            "cache": app.state.cache.stats.as_dict(),
+            "breaker": {
+                "state": app.state.breaker.state,
+                "opened_count": app.state.breaker.opened_count,
             },
         }
 
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def dashboard():
+        ledger = app.state.ledger
+        return render_dashboard(
+            totals=ledger.totals(),
+            latency=ledger.latency_percentiles(),
+            recent=ledger.recent(30),
+            cache_stats=app.state.cache.stats.as_dict(),
+            uptime_s=time.time() - getattr(app.state, "started", time.time()),
+        )
+
     @app.get("/fixtures")
     async def fixtures():
-        """What replay is serving. Makes reproducibility inspectable."""
         if not replay.enabled:
             return {"enabled": False}
         return {
@@ -142,16 +182,11 @@ def create_app(replay: ReplayConfig | None = None) -> FastAPI:
             "script": replay.script.outcomes,
             "count": len(replay.fixtures),
             "speed": replay.speed,
-            "samples": [
-                {"chars": len(f.text), "ttft_ms": round(f.ttft_ms, 1)}
-                for f in replay.fixtures[:5]
-            ],
         }
 
     def _resolve_key(request: Request) -> str:
-        # Replay needs no key at all — that is the point of it.
         if replay.enabled:
-            return "replay"
+            return "replay"          # replay needs no key at all
         if SHARED_UPSTREAM_KEY:
             return SHARED_UPSTREAM_KEY
         key = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
@@ -177,22 +212,45 @@ def create_app(replay: ReplayConfig | None = None) -> FastAPI:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        # Stage 2 of the pipeline: shape before anything is sent. Report mode
-        # only measures, so the default never alters what the model sees.
+        client = request.app.state.transport
+        breaker: CircuitBreaker = request.app.state.breaker
+        cache: ExactCache = request.app.state.cache
+        ledger = request.app.state.ledger
+
+        # STAGE 2 — shape. Report mode only measures; it never rewrites.
         shaped, report = shape_request(body, _shape_mode())
         extra = report.as_headers()
 
-        client = request.app.state.transport
-        breaker: CircuitBreaker = request.app.state.breaker
+        # STAGE 3 — exact cache, keyed on the SHAPED request.
+        use_cache = cache.cacheable(shaped)
+        cache_key = ExactCache.key_for(shaped) if use_cache else None
+
+        record = RequestRecord(
+            request_id=request_id,
+            model=shaped.get("model", ""),
+            prompt_tokens=_estimate_prompt_tokens(shaped),
+            prefix_verdict=report.verdict,
+            prefix_cacheable=report.cacheable_pct,
+        )
+
+        # Written after the response completes — for streaming, that means
+        # after the last token, so latency and token counts are real.
+        background = BackgroundTask(ledger.record, record)
 
         if shaped.get("stream"):
-            return await stream_upstream(
-                client, UPSTREAM_URL, shaped, headers, request_id, breaker, extra
+            response = await stream_upstream(
+                client, UPSTREAM_URL, shaped, headers, request_id, breaker,
+                extra, cache, cache_key, record,
+            )
+        else:
+            response = await collect_upstream(
+                client, UPSTREAM_URL, shaped, headers, request_id, breaker,
+                extra, cache, cache_key, record,
             )
 
-        return await collect_upstream(
-            client, UPSTREAM_URL, shaped, headers, request_id, breaker, extra
-        )
+        if hasattr(response, "background"):
+            response.background = background
+        return response
 
     return app
 

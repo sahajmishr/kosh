@@ -1,409 +1,89 @@
 {
-  "mode": "direct",
-  "reps": 8,
-  "rounds": 2,
-  "prefix_tokens": 2500,
+  "mode": "kosh",
+  "reps": 3,
+  "rounds": 1,
+  "prefix_tokens": 300,
   "rounds_data": [
     {
       "warm": [
         {
           "status": 200,
-          "ttft_ms": 15872.7,
-          "total_ms": 42949.4,
-          "chunks": 24,
+          "ttft_ms": 40.3,
+          "total_ms": 40.8,
+          "chunks": 60,
           "phase": "warm",
           "index": 0
         },
         {
           "status": 200,
-          "ttft_ms": 9851.4,
-          "total_ms": 10360.8,
-          "chunks": 16,
+          "ttft_ms": 7.4,
+          "total_ms": 7.8,
+          "chunks": 60,
           "phase": "warm",
           "index": 1
         },
         {
           "status": 200,
-          "ttft_ms": 4328.8,
-          "total_ms": 4562.0,
-          "chunks": 20,
+          "ttft_ms": 5.5,
+          "total_ms": 5.8,
+          "chunks": 60,
           "phase": "warm",
           "index": 2
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15918.2,
-          "total_ms": 40296.1,
-          "chunks": 26,
-          "phase": "warm",
-          "index": 3
-        },
-        {
-          "status": 200,
-          "ttft_ms": 14180.8,
-          "total_ms": 14510.0,
-          "chunks": 18,
-          "phase": "warm",
-          "index": 4
-        },
-        {
-          "status": 200,
-          "ttft_ms": 8958.3,
-          "total_ms": 9438.3,
-          "chunks": 20,
-          "phase": "warm",
-          "index": 5
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15831.3,
-          "total_ms": 16556.5,
-          "chunks": 22,
-          "phase": "warm",
-          "index": 6
-        },
-        {
-          "status": 200,
-          "ttft_ms": 9753.7,
-          "total_ms": 10288.5,
-          "chunks": 16,
-          "phase": "warm",
-          "index": 7
         }
       ],
       "cold": [
         {
           "status": 200,
-          "ttft_ms": 2468.5,
-          "total_ms": 2747.9,
-          "chunks": 18,
+          "ttft_ms": 5.7,
+          "total_ms": 6.1,
+          "chunks": 60,
           "phase": "cold",
           "index": 0
         },
         {
           "status": 200,
-          "ttft_ms": 6878.2,
-          "total_ms": 7471.3,
-          "chunks": 18,
+          "ttft_ms": 6.2,
+          "total_ms": 6.6,
+          "chunks": 60,
           "phase": "cold",
           "index": 1
         },
         {
           "status": 200,
-          "ttft_ms": 3087.0,
-          "total_ms": 3494.8,
-          "chunks": 16,
+          "ttft_ms": 5.6,
+          "total_ms": 5.9,
+          "chunks": 60,
           "phase": "cold",
           "index": 2
-        },
-        {
-          "status": 200,
-          "ttft_ms": 2491.8,
-          "total_ms": 2792.8,
-          "chunks": 16,
-          "phase": "cold",
-          "index": 3
-        },
-        {
-          "status": 200,
-          "ttft_ms": 6398.9,
-          "total_ms": 6880.5,
-          "chunks": 18,
-          "phase": "cold",
-          "index": 4
-        },
-        {
-          "status": 200,
-          "ttft_ms": 4013.6,
-          "total_ms": 4491.1,
-          "chunks": 24,
-          "phase": "cold",
-          "index": 5
-        },
-        {
-          "status": 200,
-          "ttft_ms": 3666.9,
-          "total_ms": 4789.3,
-          "chunks": 14,
-          "phase": "cold",
-          "index": 6
-        },
-        {
-          "status": 200,
-          "ttft_ms": 7573.1,
-          "total_ms": 8157.9,
-          "chunks": 18,
-          "phase": "cold",
-          "index": 7
         }
       ],
       "hostile": [
         {
           "status": 200,
-          "ttft_ms": 15841.8,
-          "total_ms": 149118.9,
-          "chunks": 54,
+          "ttft_ms": 6.7,
+          "total_ms": 7.1,
+          "chunks": 60,
           "phase": "hostile",
           "index": 0
         },
         {
           "status": 200,
-          "ttft_ms": 3199.1,
-          "total_ms": 3522.7,
-          "chunks": 18,
+          "ttft_ms": 7.3,
+          "total_ms": 7.7,
+          "chunks": 60,
           "phase": "hostile",
           "index": 1
         },
         {
           "status": 200,
-          "ttft_ms": 15836.9,
-          "total_ms": 30403.8,
-          "chunks": 22,
+          "ttft_ms": 6.4,
+          "total_ms": 6.8,
+          "chunks": 60,
           "phase": "hostile",
           "index": 2
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15860.3,
-          "total_ms": 177797.8,
-          "chunks": 62,
-          "phase": "hostile",
-          "index": 3
-        },
-        {
-          "status": 200,
-          "ttft_ms": 14192.4,
-          "total_ms": 14747.6,
-          "chunks": 18,
-          "phase": "hostile",
-          "index": 4
-        },
-        {
-          "status": 200,
-          "ttft_ms": 4092.9,
-          "total_ms": 5023.4,
-          "chunks": 22,
-          "phase": "hostile",
-          "index": 5
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15718.9,
-          "total_ms": 17719.9,
-          "chunks": 24,
-          "phase": "hostile",
-          "index": 6
-        },
-        {
-          "status": 200,
-          "ttft_ms": 7505.0,
-          "total_ms": 8314.0,
-          "chunks": 20,
-          "phase": "hostile",
-          "index": 7
-        }
-      ]
-    },
-    {
-      "warm": [
-        {
-          "status": 200,
-          "ttft_ms": 10466.6,
-          "total_ms": 10604.7,
-          "chunks": 18,
-          "phase": "warm",
-          "index": 0
-        },
-        {
-          "status": 200,
-          "ttft_ms": 11541.7,
-          "total_ms": 11719.4,
-          "chunks": 18,
-          "phase": "warm",
-          "index": 1
-        },
-        {
-          "status": 200,
-          "ttft_ms": 7190.4,
-          "total_ms": 7663.1,
-          "chunks": 18,
-          "phase": "warm",
-          "index": 2
-        },
-        {
-          "status": 200,
-          "ttft_ms": 11368.4,
-          "total_ms": 11678.6,
-          "chunks": 16,
-          "phase": "warm",
-          "index": 3
-        },
-        {
-          "status": 200,
-          "ttft_ms": 11840.0,
-          "total_ms": 12319.5,
-          "chunks": 14,
-          "phase": "warm",
-          "index": 4
-        },
-        {
-          "status": 200,
-          "ttft_ms": 3484.2,
-          "total_ms": 4008.6,
-          "chunks": 20,
-          "phase": "warm",
-          "index": 5
-        },
-        {
-          "status": 200,
-          "ttft_ms": 10023.4,
-          "total_ms": 10324.1,
-          "chunks": 18,
-          "phase": "warm",
-          "index": 6
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15747.1,
-          "total_ms": 49425.9,
-          "chunks": 30,
-          "phase": "warm",
-          "index": 7
-        }
-      ],
-      "cold": [
-        {
-          "status": 200,
-          "ttft_ms": 15919.8,
-          "total_ms": 27326.8,
-          "chunks": 20,
-          "phase": "cold",
-          "index": 0
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15837.8,
-          "total_ms": 17232.5,
-          "chunks": 22,
-          "phase": "cold",
-          "index": 1
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15840.1,
-          "total_ms": 17805.9,
-          "chunks": 24,
-          "phase": "cold",
-          "index": 2
-        },
-        {
-          "status": 200,
-          "ttft_ms": 8433.4,
-          "total_ms": 8869.5,
-          "chunks": 18,
-          "phase": "cold",
-          "index": 3
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15737.8,
-          "total_ms": 16802.9,
-          "chunks": 22,
-          "phase": "cold",
-          "index": 4
-        },
-        {
-          "status": 200,
-          "ttft_ms": 10260.6,
-          "total_ms": 10940.9,
-          "chunks": 20,
-          "phase": "cold",
-          "index": 5
-        },
-        {
-          "status": 200,
-          "ttft_ms": 13744.3,
-          "total_ms": 14378.4,
-          "chunks": 18,
-          "phase": "cold",
-          "index": 6
-        },
-        {
-          "status": 200,
-          "ttft_ms": 12489.4,
-          "total_ms": 13447.0,
-          "chunks": 18,
-          "phase": "cold",
-          "index": 7
-        }
-      ],
-      "hostile": [
-        {
-          "status": 200,
-          "ttft_ms": 15678.3,
-          "total_ms": 17915.2,
-          "chunks": 20,
-          "phase": "hostile",
-          "index": 0
-        },
-        {
-          "status": 200,
-          "ttft_ms": 11687.5,
-          "total_ms": 12320.1,
-          "chunks": 22,
-          "phase": "hostile",
-          "index": 1
-        },
-        {
-          "status": 200,
-          "ttft_ms": 11518.7,
-          "total_ms": 11863.8,
-          "chunks": 20,
-          "phase": "hostile",
-          "index": 2
-        },
-        {
-          "status": 200,
-          "ttft_ms": 3654.9,
-          "total_ms": 4034.4,
-          "chunks": 18,
-          "phase": "hostile",
-          "index": 3
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15780.5,
-          "total_ms": 16259.7,
-          "chunks": 20,
-          "phase": "hostile",
-          "index": 4
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15840.9,
-          "total_ms": 42112.6,
-          "chunks": 34,
-          "phase": "hostile",
-          "index": 5
-        },
-        {
-          "status": 200,
-          "ttft_ms": 15806.7,
-          "total_ms": 678793.8,
-          "chunks": 198,
-          "phase": "hostile",
-          "index": 6
-        },
-        {
-          "status": 200,
-          "ttft_ms": 16894.1,
-          "total_ms": 41367.9,
-          "chunks": 24,
-          "phase": "hostile",
-          "index": 7
         }
       ]
     }
   ],
-  "verdict": "no measurable prefix reuse"
+  "verdict": "inconclusive"
 }
