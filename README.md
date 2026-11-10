@@ -286,7 +286,7 @@ KOSH_UPSTREAM_BASE=http://localhost:11434/v1 KOSH_MODEL=qwen2.5 uvicorn kosh.mai
 pytest -q
 ```
 
-**163 tests in about 30 seconds. No network. No API key.**
+**164 tests in about 30 seconds. No network. No API key.**
 
 | File | Tests | Covers |
 |---|---|---|
@@ -294,7 +294,7 @@ pytest -q
 | `test_replay.py` | 18 | Determinism, byte-for-byte contract, fault injection driving the real retry path |
 | `test_shaping.py` | 37 | Volatile detection, cacheable scoring, safe reordering |
 | `test_cache.py` | 28 | Keying, truncation rejection, LRU, TTL, end-to-end hits |
-| `test_stretch.py` | 58 | Token bucket refill/burst, reasoning classifier, Jaccard scoring, adversarial pairs, and the wiring regressions below |
+| `test_stretch.py` | 59 | Token bucket refill/burst, reasoning classifier, Jaccard scoring, adversarial pairs, and the wiring regressions below |
 
 The replay tests are the ones worth reading. `ReplayTransport` replaces the **transport, not the logic** — it implements only `build_request` and `send`, so injected 503s travel through the *same* retry loop, jitter and circuit breaker as real ones. Mocking the handler instead would bypass everything the tests claim to cover.
 
@@ -313,6 +313,20 @@ straight through**, and which only appeared by running the system:
 4. Making the cache key available to the semantic store also made it
    available to the exact lookup, so `KOSH_CACHE=0` stopped disabling
    anything. The key and the lookup are two different things.
+5. The streaming cache store lived in an `else:` clause. Closing an async
+   generator throws `GeneratorExit` at its last `yield`, which is not an
+   `httpx.HTTPError`, so it propagates and Python **skips `else:` entirely**
+   — the store never ran and no streamed response was ever cached. Whether
+   the ASGI layer closes the generator before it resumes past the final
+   yield is platform- and timing-dependent, so identical code cached every
+   streamed response on Linux and none at all on Windows. The store is now
+   in a `finally:`, and completion is detected either from normal iteration
+   or from the provider's terminal `data: [DONE]` frame.
+
+Bug 5 is the one worth remembering: it shipped green through 163 tests and
+only appeared on another machine. `test_stream_store_survives_generator_closed_before_it_resumes`
+reproduces the Windows behaviour directly by consuming up to the terminal
+frame and then closing the generator instead of letting it resume.
 
 Each of the four now has a regression test that was **verified to fail when
 the bug is reintroduced** — and every one is parameterised over both the
@@ -351,7 +365,7 @@ kosh/
 │   ├── ledger.py      SQLite WAL request log
 │   ├── dashboard.py   single-file HTML dashboard, no CDN
 │   └── upstream.py    SSE passthrough and non-streaming paths
-├── tests/             163 tests, no network
+├── tests/             164 tests, no network
 ├── scripts/
 │   ├── demo.py                 one-command walkthrough (works offline)
 │   ├── bench_cache.py          cache hit rate + false-hit detection
