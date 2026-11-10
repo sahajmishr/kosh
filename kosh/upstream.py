@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from kosh.cache import ExactCache, parse_sse
 from kosh.ledger import RequestRecord
+from kosh.semantic import SemanticCache
 from kosh.resilience import CircuitBreaker, UpstreamResult, open_with_retry
 
 # Stop proxies and browsers from buffering an SSE stream.
@@ -85,6 +86,8 @@ async def stream_upstream(
     cache: ExactCache | None = None,
     cache_key: str | None = None,
     record: RequestRecord | None = None,
+    semantic: SemanticCache | None = None,
+    prompt_text: str = "",
 ) -> StreamingResponse | JSONResponse:
     """Proxy a streaming chat-completions request, byte for byte."""
     # --- cache lookup (before we touch the upstream at all) -----------------
@@ -103,6 +106,28 @@ async def stream_upstream(
             response.headers["x-kosh-cache"] = "hit"
             return response
 
+    # --- near-duplicate lookup (only if the exact cache missed) -------------
+    if semantic is not None and semantic.enabled and prompt_text:
+        # exclude_key exists so we never serve an entry the exact cache
+        # already let expire. With the exact cache off there is no TTL to
+        # honour, so a byte-identical repeat is a genuine duplicate and
+        # should hit.
+        near = semantic.find(
+            prompt_text, exclude_key=cache_key if cache is not None else None
+        )
+        if near is not None:
+            if record is not None:
+                record.cache = "near"
+                record.completion_tokens = max(0, len(near.text) // 4)
+                record.saved_tokens = max(0, len(near.text) // 4)
+                record.attempts = 0
+                record.latency_ms = 0.0
+            response = _cache_hit_stream(near)
+            for name, value in (extra_headers or {}).items():
+                response.headers[name] = value
+            response.headers["x-kosh-cache"] = "near"
+            return response
+
     result = await open_with_retry(client, url, body, headers, breaker)
     if result.response is None:
         return _error_response(result, request_id)
@@ -112,13 +137,20 @@ async def stream_upstream(
     async def generate() -> AsyncIterator[bytes]:
         buffer = bytearray()
         started = time.perf_counter()
+        saw_bytes = False
         try:
             # Raw byte passthrough. We do NOT re-frame the SSE: the provider
             # already emits `data: {...}\n\n`, keepalives and `data: [DONE]`.
             # Parsing and rebuilding would only introduce bugs.
             async for chunk in upstream.aiter_bytes():
-                if cache is not None:
-                    buffer.extend(chunk)      # tee: client first, always
+                if chunk:
+                    saw_bytes = True
+                # Tee on cache_key, NOT on `cache`: the near-duplicate store
+                # needs the same bytes. Gating this on the exact cache meant
+                # KOSH_CACHE=0 left the buffer empty and every streaming
+                # store was rejected with finish_reason="".
+                if cache_key:
+                    buffer.extend(chunk)      # client first, always
                 yield chunk
         except httpx.HTTPError as exc:
             # Upstream died mid-stream. Tell the client instead of leaving it
@@ -140,9 +172,23 @@ async def stream_upstream(
             yield b"data: [DONE]\n\n"
         else:
             # Completed cleanly — now it is safe to store.
-            if cache is not None and cache_key:
+            #
+            # A 200 with zero bytes is not a clean completion. It arrives as
+            # an empty body and, because the buffer never filled, as a cache
+            # miss on every subsequent identical request — which looks
+            # exactly like "caching is broken". Record it so the ledger shows
+            # the real fault instead of a silent row of misses.
+            if not saw_bytes:
+                if record is not None:
+                    record.error = "empty_stream"
+            if cache_key:
                 lines, text, finish_reason = parse_sse(bytes(buffer))
-                cache.store(cache_key, lines, text, finish_reason)
+                if cache is not None:
+                    cache.store(cache_key, lines, text, finish_reason)
+                # Independent of the exact cache on purpose: KOSH_CACHE=0
+                # must not silently disable near-duplicate storage too.
+                if semantic is not None and semantic.enabled and prompt_text:
+                    semantic.store(cache_key, prompt_text, lines, finish_reason)
             if record is not None:
                 _lines, text, finish_reason = parse_sse(bytes(buffer))
                 record.completion_tokens = max(0, len(text) // 4)
@@ -179,6 +225,8 @@ async def collect_upstream(
     cache: ExactCache | None = None,
     cache_key: str | None = None,
     record: RequestRecord | None = None,
+    semantic: SemanticCache | None = None,
+    prompt_text: str = "",
 ) -> JSONResponse:
     """Non-streaming path: open with retry, then read the whole body."""
     if cache is not None and cache_key:
@@ -223,6 +271,47 @@ async def collect_upstream(
                 },
             )
 
+    # --- near-duplicate lookup (only if the exact cache missed) -------------
+    if semantic is not None and semantic.enabled and prompt_text:
+        # exclude_key exists so we never serve an entry the exact cache
+        # already let expire. With the exact cache off there is no TTL to
+        # honour, so a byte-identical repeat is a genuine duplicate and
+        # should hit.
+        near = semantic.find(
+            prompt_text, exclude_key=cache_key if cache is not None else None
+        )
+        if near is not None:
+            if record is not None:
+                record.cache = "near"
+                record.completion_tokens = max(0, len(near.text) // 4)
+                record.saved_tokens = max(0, len(near.text) // 4)
+                record.attempts = 0
+                record.latency_ms = 0.0
+            return JSONResponse(
+                content={
+                    "id": f"chatcmpl-kosh-near-{near.key[:12]}",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": body.get("model", ""),
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": near.text},
+                        "finish_reason": near.finish_reason,
+                    }],
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": max(0, len(near.text) // 4),
+                        "total_tokens": max(0, len(near.text) // 4),
+                    },
+                },
+                headers={
+                    "x-kosh-cache": "near",
+                    "x-kosh-latency-ms": "0.0",
+                    "x-kosh-attempts": "0",
+                    **(extra_headers or {}),
+                },
+            )
+
     started = time.perf_counter()
     result = await open_with_retry(client, url, body, headers, breaker)
     if result.response is None:
@@ -261,7 +350,9 @@ async def collect_upstream(
         )
 
     # Cache only what we can prove is complete.
-    if cache is not None and cache_key:
+    # Guarded on cache_key alone, NOT on `cache`: the semantic cache is an
+    # independent store and must keep working when KOSH_CACHE=0.
+    if cache_key:
         finish_reason = ""
         choices = payload.get("choices") or []
         if choices:
@@ -289,7 +380,11 @@ async def collect_upstream(
                 }, separators=(",", ":")),
                 "data: [DONE]",
             ]
-            cache.store(cache_key, replay, text, finish_reason, payload=payload)
+            if cache is not None:
+                cache.store(cache_key, replay, text, finish_reason,
+                            payload=payload)
+            if semantic is not None and semantic.enabled and prompt_text:
+                semantic.store(cache_key, prompt_text, replay, finish_reason)
 
     if record is not None:
         usage = payload.get("usage") or {}

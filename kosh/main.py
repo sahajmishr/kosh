@@ -26,15 +26,18 @@ from contextlib import asynccontextmanager
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 from kosh.cache import ExactCache, cache_from_env
+from kosh.admission import bucket_from_env
 from kosh.dashboard import render as render_dashboard
 from kosh.ledger import RequestRecord, ledger_from_env
 from kosh.replay import PROFILES, ReplayConfig, ReplayTransport, config_from_env
 from kosh.resilience import CircuitBreaker
 from kosh.shaping import MODES as SHAPE_MODES
+from kosh.reasoning import NONE, PolicyStats, apply_policy, policy_from_env
+from kosh.semantic import semantic_from_env
 from kosh.shaping import flatten, shape_request
 from kosh.upstream import collect_upstream, stream_upstream
 
@@ -98,6 +101,9 @@ def create_app(replay: ReplayConfig | None = None) -> FastAPI:
             ReplayTransport(replay) if replay.enabled else app.state.upstream
         )
         app.state.cache = cache_from_env()
+        app.state.semantic = semantic_from_env()      # off unless enabled
+        app.state.reasoning_stats = PolicyStats()
+        app.state.bucket = bucket_from_env()           # off unless KOSH_RATE_LIMIT
         app.state.ledger = ledger_from_env()
         app.state.started = time.time()
         yield
@@ -122,6 +128,17 @@ def create_app(replay: ReplayConfig | None = None) -> FastAPI:
                 "fixtures": len(replay.fixtures),
             },
             "shaping": {"mode": _shape_mode()},
+            "admission": {
+                "enabled": app.state.bucket.enabled,
+                "rate_per_minute": app.state.bucket.rate_per_minute,
+                "burst": app.state.bucket.burst,
+            },
+            "semantic": {
+                "enabled": app.state.semantic.enabled,
+                "threshold": app.state.semantic.threshold,
+                "entries": len(app.state.semantic),
+            },
+            "reasoning": {"policy": policy_from_env()},
             "breaker": {
                 "state": breaker.state,
                 "failures": breaker.failures,
@@ -155,6 +172,18 @@ def create_app(replay: ReplayConfig | None = None) -> FastAPI:
             "totals": app.state.ledger.totals(),
             "latency_uncached": app.state.ledger.latency_percentiles(),
             "cache": app.state.cache.stats.as_dict(),
+            "semantic": {
+                "enabled": app.state.semantic.enabled,
+                "lookups": app.state.semantic.stats.lookups,
+                "hits": app.state.semantic.stats.hits,
+                "hit_rate_pct": app.state.semantic.stats.hit_rate,
+                "entries": len(app.state.semantic),
+            },
+            "admission": app.state.bucket.stats(),
+            "reasoning": {
+                "policy": policy_from_env(),
+                **app.state.reasoning_stats.as_dict(),
+            },
             "breaker": {
                 "state": app.state.breaker.state,
                 "opened_count": app.state.breaker.opened_count,
@@ -217,13 +246,56 @@ def create_app(replay: ReplayConfig | None = None) -> FastAPI:
         cache: ExactCache = request.app.state.cache
         ledger = request.app.state.ledger
 
-        # STAGE 2 — shape. Report mode only measures; it never rewrites.
+        # STAGE 5 — admission. Checked before we do any work, but only
+        # CONSUMED if the request actually reaches the upstream, so a cache
+        # hit costs nothing against the budget.
+        bucket = request.app.state.bucket
+        bucket_key = api_key[:16] or "anonymous"
+        allowed, retry_after = bucket.check(bucket_key)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": "rate_limited",
+                    "detail": "Kosh admission control: local budget exhausted.",
+                    "retry_after_seconds": retry_after,
+                    "kosh_request_id": request_id,
+                },
+                headers={"Retry-After": str(max(1, int(retry_after) + 1))},
+            )
+
+        prompt_text = flatten(body.get("messages") or [])
+
+        # STAGE 2a — reasoning policy. Only ever downgrades, never upgrades.
+        reasoning_action = "off"
+        if policy_from_env() == "auto":
+            body, reasoning_action = apply_policy(body, prompt_text)
+            request.app.state.reasoning_stats.record(reasoning_action)
+            if reasoning_action == NONE:
+                extra_reasoning = {"x-kosh-reasoning": "none"}
+            else:
+                extra_reasoning = {"x-kosh-reasoning": reasoning_action}
+
+        # STAGE 2b — shape. Report mode only measures; it never rewrites.
         shaped, report = shape_request(body, _shape_mode())
         extra = report.as_headers()
+        if policy_from_env() == "auto":
+            extra.update(extra_reasoning)
 
-        # STAGE 3 — exact cache, keyed on the SHAPED request.
+        # STAGE 3 — caching, keyed on the SHAPED request.
+        # The key must exist if EITHER cache is enabled: the near-duplicate
+        # store is keyed on the same string, so disabling the exact cache
+        # must not silently disable semantic storage as well.
         use_cache = cache.cacheable(shaped)
-        cache_key = ExactCache.key_for(shaped) if use_cache else None
+        use_semantic = request.app.state.semantic.enabled
+        # Two separate things:
+        #   cache_key - the identity string. Needed by the near-duplicate
+        #               store too, so it exists if EITHER cache is on.
+        #   exact     - the exact cache OBJECT. Passed as None when the exact
+        #               cache is off, so its lookup cannot run. Without this,
+        #               KOSH_CACHE=0 would still serve exact hits.
+        cache_key = ExactCache.key_for(shaped) if (use_cache or use_semantic) else None
+        exact = cache if use_cache else None
 
         record = RequestRecord(
             request_id=request_id,
@@ -237,16 +309,23 @@ def create_app(replay: ReplayConfig | None = None) -> FastAPI:
         # after the last token, so latency and token counts are real.
         background = BackgroundTask(ledger.record, record)
 
+        semantic = request.app.state.semantic
+
         if shaped.get("stream"):
             response = await stream_upstream(
                 client, UPSTREAM_URL, shaped, headers, request_id, breaker,
-                extra, cache, cache_key, record,
+                extra, exact, cache_key, record, semantic, prompt_text,
             )
         else:
             response = await collect_upstream(
                 client, UPSTREAM_URL, shaped, headers, request_id, breaker,
-                extra, cache, cache_key, record,
+                extra, exact, cache_key, record, semantic, prompt_text,
             )
+
+        # Only spend budget if we actually went upstream. Cache and
+        # near-duplicate hits are free — that is the point.
+        if response.headers.get("x-kosh-cache") in (None, "miss"):
+            bucket.consume(bucket_key)
 
         if hasattr(response, "background"):
             response.background = background

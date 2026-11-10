@@ -150,6 +150,106 @@ The second line is the same prompt with `"Current date: 2026-10-29T14:22:07Z\n"`
 
 ---
 
+## Admission, reasoning policy, and near-duplicate cache
+
+Three optional stages. All three are off unless you turn them on, and each
+one is measured below rather than asserted.
+
+### Admission control — a cache hit must not be charged
+
+`kosh/admission.py` is a per-key token bucket, but the interesting part is
+that `check()` and `consume()` are deliberately separate calls. A request
+that is served from cache never reaches the GPU, so it must never spend a
+token. The gateway checks the bucket before doing any work, then consumes
+only if the request actually went upstream:
+
+    check()   -> admit?                      (every request)
+    consume() -> spend                       (only if x-kosh-cache is absent)
+
+Charging cached requests would mean a client that already saved you 100%
+of the work gets rate-limited for it.
+
+`KOSH_RATE_LIMIT=60` with 65 rapid requests: 60 admitted, 5 rejected with
+429 and a `Retry-After`.
+
+### Reasoning policy — only ever downgrades
+
+On Day 1 one request took 141.6 s while its neighbours took 11-37 s. The
+cause was not the GPU: `qwen-3.8-27b` emits `<think>` tokens and those
+count against `max_tokens`, so the model spent its whole output budget
+thinking and returned a truncated answer with a 200 status. Setting
+`reasoning_effort="none"` dropped that run to 19 s.
+
+`kosh/reasoning.py` turns that accident into a policy. The rule is
+asymmetric on purpose:
+
+- it will only ever **downgrade** to `reasoning_effort: "none"`, never upgrade
+- it never overrides a value the caller set explicitly
+- if the classifier is unsure, it leaves the request alone
+
+Removing reasoning from a task that needed it produces a worse answer;
+leaving it on a task that didn't only costs time. Of those two failures the
+first is worse, so the classifier errs toward keeping it.
+
+Measured over 4 prompts with `KOSH_REASONING=auto`: 3 downgraded, 1 kept,
+0 caller-set values overridden.
+
+### Near-duplicate cache — and what it is not
+
+This is **lexical near-duplicate matching: Jaccard similarity over
+normalised token sets, with an inverted index so only plausible candidates
+are scored.** It is not embedding-based semantic similarity, and the
+difference matters:
+
+| it catches | it does not catch |
+|---|---|
+| case and punctuation changes | paraphrase |
+| whitespace and filler words | synonym swaps |
+| token reordering | different meaning, same shape |
+
+Measured: "Please explain the difference between TCP and UDP in computer
+networking" vs "Explain the difference between TCP and UDP in computer
+networking" scores **1.000**. "How do I sort a list?" vs "What is the best
+way to order these items?" scores **0.000**. "Explain why the sky looks
+blue" vs "What causes the sky to appear blue in colour" scores **0.286**.
+Calling it semantic would be overclaiming, so it isn't called that in the
+code either.
+
+**The benchmark** (`scripts/bench_semantic.py`) — 12 prompts x 5 variants,
+exact cache on in both runs, so the gain is attributable to this feature
+alone:
+
+| variant | exact only | + near-dup | gain | false hits |
+|---|---|---|---|---|
+| exact repeat | 12/12 | 12/12 | 0 | – |
+| punctuation | 0/12 | 12/12 | +12 | – |
+| whitespace | 0/12 | 12/12 | +12 | – |
+| filler word | 0/12 | 12/12 | +12 | – |
+| **adversarial** (one noun swapped) | 0/12 | 0/12 | 0 | **0** |
+| **TOTAL** | **12/60** | **48/60** | **+36** | **0** |
+
+36 of 60 upstream calls avoided (60.0 pp), 0 false hits.
+
+**Where it breaks** — the threshold is a dial between hit rate and
+correctness. Turning it down buys hits and pays in false hits, so the cliff
+is measured rather than guessed (`--sweep`):
+
+| threshold | 0.50 | 0.60 | 0.70 | 0.75 | 0.80 | 0.92 | 0.95 |
+|---|---|---|---|---|---|---|---|
+| served | 59 | 57 | 52 | 50 | 48 | 48 | 48 |
+| false hits | 11 | 9 | 4 | 2 | **0** | **0** | **0** |
+
+The cliff sits between 0.75 and 0.80. The default of 0.92 is chosen to sit
+clear of it, not to maximise hit rate — at 0.50 the cache answers 11 of 12
+questions nobody asked, which is a silent correctness failure and the one
+outcome this feature must never produce.
+
+Two further limits, both deliberate: prompts with fewer than
+`KOSH_SEMANTIC_MIN_TOKENS` content tokens skip fuzzy matching entirely (so
+"capital of India?" vs "capital of Nepal?" never reaches the scorer), and
+entries are only stored when `finish_reason` is a clean stop — never a
+truncation or an error, the same rule the exact cache follows.
+
 ## Running it for real
 
 ```bash
@@ -186,7 +286,7 @@ KOSH_UPSTREAM_BASE=http://localhost:11434/v1 KOSH_MODEL=qwen2.5 uvicorn kosh.mai
 pytest -q
 ```
 
-**105 tests in about half a second. No network. No API key.**
+**163 tests in about 30 seconds. No network. No API key.**
 
 | File | Tests | Covers |
 |---|---|---|
@@ -194,12 +294,36 @@ pytest -q
 | `test_replay.py` | 18 | Determinism, byte-for-byte contract, fault injection driving the real retry path |
 | `test_shaping.py` | 37 | Volatile detection, cacheable scoring, safe reordering |
 | `test_cache.py` | 28 | Keying, truncation rejection, LRU, TTL, end-to-end hits |
+| `test_stretch.py` | 58 | Token bucket refill/burst, reasoning classifier, Jaccard scoring, adversarial pairs, and the wiring regressions below |
 
 The replay tests are the ones worth reading. `ReplayTransport` replaces the **transport, not the logic** — it implements only `build_request` and `send`, so injected 503s travel through the *same* retry loop, jitter and circuit breaker as real ones. Mocking the handler instead would bypass everything the tests claim to cover.
+
+`test_stretch.py` exists because of four bugs that **all unit tests passed
+straight through**, and which only appeared by running the system:
+
+1. `ExactCache.store(key, lines, text, ...)` and `SemanticCache.store(key,
+   text, lines, ...)` take their arguments in **opposite order**. Both call
+   sites passed the *completion* into the prompt slot, so every entry was
+   indexed by the model's answer and no near-duplicate could ever hit.
+2. The near-duplicate `store()` was nested inside the exact cache's
+   enabled-check, so `KOSH_CACHE=0` silently disabled both.
+3. The streaming tee that buffers bytes for caching was gated on the exact
+   cache too — with it off, the buffer stayed empty and every streaming
+   store was rejected for an empty `finish_reason`.
+4. Making the cache key available to the semantic store also made it
+   available to the exact lookup, so `KOSH_CACHE=0` stopped disabling
+   anything. The key and the lookup are two different things.
+
+Each of the four now has a regression test that was **verified to fail when
+the bug is reintroduced** — and every one is parameterised over both the
+streamed and non-streamed path, because the wiring exists twice in
+`upstream.py` and a test covering only one lets the bug live in the other.
 
 ---
 
 ## What this does not prove
+
+*(See also the near-duplicate cache's own limits in the section above: it is lexical, and paraphrase scores 0.000-0.286.)*
 
 Published alongside the results, because a benchmark that lists no weaknesses is marketing.
 
@@ -219,16 +343,20 @@ kosh/
 │   ├── main.py        FastAPI app, 9-stage pipeline, /dashboard, /stats
 │   ├── shaping.py     prefix hygiene: detect, score, safely reorder
 │   ├── cache.py       exact cache; refuses truncated and errored responses
+│   ├── semantic.py    near-duplicate cache (lexical, not embeddings)
+│   ├── admission.py   per-key token bucket; check and consume are separate
+│   ├── reasoning.py   reasoning policy; only ever downgrades
 │   ├── resilience.py  full-jitter backoff, Retry-After, circuit breaker
 │   ├── replay.py      deterministic replay + fault injection
 │   ├── ledger.py      SQLite WAL request log
 │   ├── dashboard.py   single-file HTML dashboard, no CDN
 │   └── upstream.py    SSE passthrough and non-streaming paths
-├── tests/             105 tests, no network
+├── tests/             163 tests, no network
 ├── scripts/
 │   ├── demo.py                 one-command walkthrough (works offline)
 │   ├── bench_cache.py          cache hit rate + false-hit detection
 │   ├── bench_replay.py         failure behaviour vs a naive client
+│   ├── bench_semantic.py       near-duplicate gain + false-hit cliff sweep
 │   ├── bench_prefix.py         live prefix experiment (uses real tokens)
 │   ├── probe_cached_tokens.py  15-second direct prefix-cache probe
 │   └── smoke.py                A/B harness against the live API
@@ -239,7 +367,11 @@ kosh/
 
 ## Roadmap
 
-Post-freeze, in order: semantic cache (measured against the exact-cache baseline above), token-bucket admission control, per-task reasoning policy. Deliberately **not** planned: React, Docker, Redis, an ORM, or a vector database — each is infrastructure theatre at this scale, and every one costs days.
+The three stages listed here previously as future work are now built and measured above: near-duplicate cache, token-bucket admission, and reasoning policy.
+
+Deliberately **not** planned: React, Docker, Redis, an ORM, or a vector database — each is infrastructure theatre at this scale, and every one costs days.
+
+The one change that would move the numbers most is real embedding-based similarity, which would catch paraphrase and synonym swaps (measured at 0.000-0.286 Jaccard today, i.e. complete misses). That needs a model to embed with, which on a shared GPU means spending the very tokens this project is trying not to spend. It is the right next step, and it is not free.
 
 ---
 
